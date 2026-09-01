@@ -31,9 +31,17 @@ def _openapi(project: Project) -> dict:
         except Exception:
             continue
         sch = json_schema(name, spec.ftypes, spec.contract.version)
+        params_doc = [{"name": pn, "in": "query",
+                       "required": pp.required,
+                       "schema": {"type": "string"},
+                       "description": pp.desc}
+                      for pn, pp in spec.params.items()] if spec.is_lookup else []
+        summary = (f"Live lookup {name} by {', '.join(spec.params)}"
+                   if spec.is_lookup else f"Latest {name} data (cached snapshot)")
         paths[f"/v1/{name}"] = {
             "get": {
-                "summary": f"Latest {name} data (cached snapshot)",
+                "summary": summary,
+                "parameters": params_doc,
                 "responses": {"200": {
                     "description": "envelope",
                     "content": {"application/json": {"schema": {
@@ -133,13 +141,31 @@ def make_app(project: Project):
                     status, headers, payload = _json_response(
                         429, {"error": "refresh already running or cooling down"})
             elif rest in names and method == "GET":
-                dp = project.data_path(rest)
-                if dp.exists():
-                    env = json.loads(dp.read_text())
-                    status, headers, payload = _json_response(200, env)
+                spec = project.load_source(rest)
+                if spec.is_lookup:
+                    from urllib.parse import parse_qs
+                    qs = parse_qs(scope.get("query_string", b"").decode())
+                    values = {k: v[0] for k, v in qs.items()}
+                    missing = spec.missing_params(values)
+                    if missing:
+                        status, headers, payload = _json_response(
+                            400, {"error": f"missing required param(s): {', '.join(missing)}",
+                                  "params": {n: p.type for n, p in spec.params.items()}})
+                    else:
+                        from .lookup import run_lookup
+                        lock = Lock.load(project.lock_path)
+                        lres = await run_lookup(project, spec, lock, values)
+                        code = {"ok": 200, "not_found": 200, "blocked": 502,
+                                "broken": 503, "error": 400}.get(lres.status, 200)
+                        status, headers, payload = _json_response(code, lres.envelope)
                 else:
-                    status, headers, payload = _json_response(
-                        503, {"error": f"no data yet for {rest!r} — run `stalin run {rest}`"})
+                    dp = project.data_path(rest)
+                    if dp.exists():
+                        env = json.loads(dp.read_text())
+                        status, headers, payload = _json_response(200, env)
+                    else:
+                        status, headers, payload = _json_response(
+                            503, {"error": f"no data yet for {rest!r} — run `stalin run {rest}`"})
         await send({"type": "http.response.start", "status": status,
                     "headers": headers})
         await send({"type": "http.response.body", "body": payload})

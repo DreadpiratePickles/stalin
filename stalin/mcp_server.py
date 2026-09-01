@@ -36,7 +36,42 @@ def _tool_result(payload) -> dict:
                          "text": json.dumps(payload, ensure_ascii=False, indent=1)}]}
 
 
+def _lookup_tools(project: Project) -> list:
+    """Each live_lookup source with expose_as_tool becomes a typed MCP tool."""
+    tools = []
+    for n in project.source_names():
+        try:
+            spec = project.load_source(n)
+        except Exception:
+            continue
+        if not (spec.is_lookup and spec.expose_as_tool):
+            continue
+        props = {pn: {"type": "string", "description": pp.desc}
+                 for pn, pp in spec.params.items()}
+        required = [pn for pn, pp in spec.params.items() if pp.required]
+        tools.append({
+            "name": f"lookup_{n}",
+            "description": (f"Live lookup of {n} by {', '.join(spec.params)}. "
+                            f"Returns typed, self-healing JSON scraped on demand from "
+                            f"{spec.url}."),
+            "inputSchema": {"type": "object", "properties": props, "required": required},
+        })
+    return tools
+
+
 def _call_tool(project: Project, name: str, args: dict) -> dict:
+    if name.startswith("lookup_"):
+        src = name[len("lookup_"):]
+        if src not in project.source_names():
+            return {"content": [{"type": "text", "text": f"unknown source {src!r}"}],
+                    "isError": True}
+        import asyncio
+        from .lookup import run_lookup
+        from .lockfile import Lock
+        spec = project.load_source(src)
+        lock = Lock.load(project.lock_path)
+        lres = asyncio.run(run_lookup(project, spec, lock, args or {}))
+        return _tool_result(lres.envelope or {"error": lres.error, "status": lres.status})
     if name == "list_sources":
         from .lockfile import Lock
         lock = Lock.load(project.lock_path)
@@ -82,7 +117,7 @@ def serve_stdio(project: Project) -> None:
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "stalin", "version": "0.1.0"}}
         elif method == "tools/list":
-            resp = {"tools": TOOLS}
+            resp = {"tools": TOOLS + _lookup_tools(project)}
         elif method == "tools/call":
             p = req.get("params", {})
             try:

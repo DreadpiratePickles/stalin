@@ -89,6 +89,17 @@ def _parse_fields(spec_text: str) -> dict[str, FieldSpec]:
     return fields
 
 
+def _parse_kv(pairs: List[str]) -> dict:
+    """['tag=love','x=1'] -> {'tag':'love','x':'1'}."""
+    out: dict = {}
+    for item in pairs or []:
+        if "=" not in item:
+            raise typer.BadParameter(f"expected name=value, got {item!r}")
+        k, v = item.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
 def _prompt_fields() -> dict[str, FieldSpec]:
     err_console.print("  define fields (empty name to finish):")
     fields: dict[str, FieldSpec] = {}
@@ -116,6 +127,12 @@ def add(
                                          help="Inline field spec: 'name: type desc' per line"),
     item: Optional[str] = typer.Option(None, "--item",
                                        help="NL description of the repeating item"),
+    example: List[str] = typer.Option(None, "--example",
+                                      help="For {param} URLs: sample value(s) to compile "
+                                           "against, e.g. --example tag=love (repeatable)"),
+    not_found: Optional[str] = typer.Option(None, "--not-found",
+                                            help="Signal for a valid-but-empty page, e.g. "
+                                                 "\"title contains 'No results'\""),
     no_llm: bool = typer.Option(False, "--no-llm",
                                 help="Skip LLM; write a skeleton for hand-written selectors"),
     recompile: bool = typer.Option(False, "--recompile",
@@ -133,16 +150,40 @@ def add(
         src_name = name or urlparse(url).netloc.replace("www.", "").split(":")[0] \
             .replace(".", "-")
         fdict = _parse_fields(fields) if fields else _prompt_fields()
-        spec = SourceSpec(name=src_name, url=url, item=item, fields=fdict)
+        import re as _re
+        from .config import ParamSpec, NotFoundSpec
+        placeholders = _re.findall(r"\{(\w+)\}", url)
+        ex = _parse_kv(example) if example else {}
+        # query-style params: supplied via --example but not in the path template
+        qparams = {k for k in ex if k not in placeholders}
+        if placeholders or qparams:
+            params = {pn: ParamSpec(location="path",
+                                    desc=f"the {pn} to look up") for pn in placeholders}
+            for pn in qparams:
+                params[pn] = ParamSpec(location="query", desc=f"the {pn} to look up")
+            if not ex:
+                err_console.print(f"  {FAIL} this URL has parameters {placeholders or list(qparams)} "
+                                  "— supply sample value(s) with --example name=value so stalin "
+                                  "can compile against a real page")
+                raise typer.Exit(1)
+            nf = NotFoundSpec.from_signal(not_found) if not_found else None
+            spec = SourceSpec(name=src_name, url=url, mode="live_lookup", item=item,
+                              fields=fdict, params=params, heal_fixture=ex,
+                              not_found=nf,
+                              contract=__import__("stalin.config", fromlist=["ContractSpec"]).ContractSpec(min_items=0))
+        else:
+            spec = SourceSpec(name=src_name, url=url, item=item, fields=fdict)
 
     # fetch
     from .engine import FetchBlocked, RobotsDisallowed, build_engine, classify
 
+    fetch_url = spec.bind_url(spec.heal_fixture) if spec.is_lookup else spec.url
+
     async def _fetch():
         async with build_engine(project.config, spec) as eng:
-            return await eng.fetch(spec.url, conditional=False)
+            return await eng.fetch(fetch_url, conditional=False)
 
-    with err_console.status(f"fetching {urlparse(spec.url).netloc} …"):
+    with err_console.status(f"fetching {urlparse(fetch_url).netloc} …"):
         try:
             fetch = asyncio.run(_fetch())
         except RobotsDisallowed as e:
@@ -224,8 +265,18 @@ def add(
         f"\n  {OK} wrote sources/{spec.name}.yml, .stalin/lock.json "
         f"(schema v{spec.contract.version}, {n_fb} fallbacks) "
         f"[dim]{time.monotonic()-t_all:.1f}s[/dim]")
-    err_console.print(f"  next: [bold]stalin run {spec.name}[/bold] · "
-                      f"[bold]stalin serve[/bold]")
+    if spec.is_lookup:
+        ex = "&".join(f"{k}={v}" for k, v in spec.heal_fixture.items())
+        err_console.print(f"  [bold]live lookup[/bold] — params: "
+                          f"{', '.join(spec.params)}")
+        err_console.print(f"  next: [bold]stalin run {spec.name} "
+                          f"{' '.join('--param '+k+'='+v for k,v in spec.heal_fixture.items())}"
+                          f"[/bold]")
+        err_console.print(f"        [bold]stalin serve[/bold] → "
+                          f"GET /v1/{spec.name}?{ex}")
+    else:
+        err_console.print(f"  next: [bold]stalin run {spec.name}[/bold] · "
+                          f"[bold]stalin serve[/bold]")
     if outcome.failed_fields:
         raise typer.Exit(1)
 
@@ -234,6 +285,8 @@ def add(
 @app.command()
 def run(
     sources: List[str] = typer.Argument(None),
+    param: List[str] = typer.Option(None, "--param",
+                                    help="For live_lookup sources: name=value (repeatable)"),
     as_json: bool = typer.Option(False, "--json", help="Force JSON to stdout"),
     jsonl: Optional[Path] = typer.Option(None, "--jsonl", help="Append envelope to JSONL file"),
     flat: bool = typer.Option(False, "--flat", help="With --jsonl: one item per line"),
@@ -245,6 +298,31 @@ def run(
     """Extract now. Auto-heals on drift (that's the whole point)."""
     project = _project()
     names = _names(project, sources or [])
+    # live_lookup sources take --param and run live
+    lookup_names = [n for n in names if project.load_source(n).is_lookup]
+    if lookup_names:
+        if len(names) > 1:
+            err_console.print(f"  {FAIL} run one lookup source at a time (with --param)")
+            raise typer.Exit(1)
+        import asyncio as _asyncio
+        from .lookup import run_lookup
+        from .lockfile import Lock as _Lock
+        spec = project.load_source(names[0])
+        values = _parse_kv(param)
+        lock = _Lock.load(project.lock_path)
+        lres = _asyncio.run(run_lookup(project, spec, lock, values))
+        mark = OK if lres.status in ("ok", "not_found") else FAIL
+        healed = (f"  ({len(lres.healed_fields)} healed)" if lres.healed_fields else "")
+        err_console.print(f"  {mark} [bold]{lres.source}[/bold]  {lres.status.upper()}  "
+                          f"{lres.envelope.get('count', 0)} items  {lres.elapsed:.1f}s"
+                          f"{healed}")
+        if lres.error:
+            err_console.print(f"      {lres.error}")
+        if lres.envelope and (as_json or not is_tty()):
+            emit_json(lres.envelope)
+        elif lres.items and is_tty():
+            items_table(lres.source, lres.envelope.get("url", ""), lres.items)
+        raise typer.Exit(lres.exit_code)
     from .runner import run_sources_sync
     ui = UI()
     results = run_sources_sync(project, names, no_heal=no_heal, ui=ui)

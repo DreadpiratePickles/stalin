@@ -50,6 +50,54 @@ class ProjectConfig(BaseModel):
     drift: DriftConfig = Field(default_factory=DriftConfig)
 
 
+class ParamSpec(BaseModel):
+    """A typed query parameter for a live_lookup source."""
+    type: str = "str"
+    required: bool = True
+    default: Optional[str] = None
+    location: str = "auto"      # auto | path | query  (auto: path if {name} in url)
+    desc: str = ""
+
+    @field_validator("type")
+    @classmethod
+    def _valid(cls, v: str) -> str:
+        parse_type(v)
+        return v
+
+    @property
+    def ftype(self) -> FieldType:
+        return parse_type(self.type)
+
+
+class NotFoundSpec(BaseModel):
+    """How to recognize a valid-but-empty result (vs a heal-worthy break).
+
+    A matched not_found page returns an empty result and is NEVER healed
+    against — same principle as never healing against a block page."""
+    contains: Optional[str] = None
+    title_contains: Optional[str] = None
+    status: Optional[int] = None
+
+    def matches(self, html: str, status: int, title: str) -> bool:
+        if self.status is not None and status == self.status:
+            return True
+        if self.title_contains and self.title_contains.lower() in title.lower():
+            return True
+        if self.contains and self.contains.lower() in html.lower():
+            return True
+        return False
+
+    @classmethod
+    def from_signal(cls, signal: str) -> "NotFoundSpec":
+        """Parse a plain-English signal like: page title contains 'User not found'."""
+        import re as _re
+        m = _re.search(r"['\"]([^'\"]+)['\"]", signal)
+        needle = m.group(1) if m else signal.strip()
+        if "title" in signal.lower():
+            return cls(title_contains=needle)
+        return cls(contains=needle)
+
+
 class FieldSpec(BaseModel):
     type: str = "str"
     desc: str = ""
@@ -77,16 +125,50 @@ class ContractSpec(BaseModel):
 class SourceSpec(BaseModel):
     name: str
     url: str
+    mode: str = "static_feed"           # static_feed | live_lookup
     schedule: str = "15m"
     item: Optional[str] = None          # NL description of repeating unit; None = detail page
     fields: dict[str, FieldSpec]
+    params: dict[str, ParamSpec] = Field(default_factory=dict)
+    cache_ttl: int = 0                  # seconds to memoize identical live_lookup params
+    not_found: Optional[NotFoundSpec] = None
+    heal_fixture: dict[str, str] = Field(default_factory=dict)  # sample params for healing
     contract: ContractSpec = Field(default_factory=ContractSpec)
     engine: Optional[str] = None
     robots: Optional[str] = None
+    expose_as_tool: bool = True         # parameterized sources are MCP tools by default
 
     @property
     def ftypes(self) -> dict[str, FieldType]:
         return {k: f.ftype for k, f in self.fields.items()}
+
+    @property
+    def is_lookup(self) -> bool:
+        return self.mode == "live_lookup" or bool(self.params)
+
+    def missing_params(self, values: dict) -> list[str]:
+        return [n for n, p in self.params.items()
+                if p.required and values.get(n) in (None, "")
+                and p.default is None]
+
+    def bind_url(self, values: dict) -> str:
+        """Bind param values into the URL template. {name} -> path; else query."""
+        from urllib.parse import quote, urlencode
+        url = self.url
+        query: dict = {}
+        for pname, pspec in self.params.items():
+            raw = values.get(pname, pspec.default)
+            if raw is None or raw == "":
+                continue
+            val = str(raw)
+            ph = "{" + pname + "}"
+            if ph in url and pspec.location in ("auto", "path"):
+                url = url.replace(ph, quote(val, safe=""))
+            else:
+                query[pname] = val
+        if query:
+            url += ("&" if "?" in url else "?") + urlencode(query)
+        return url
 
 
 class Project:
@@ -164,6 +246,18 @@ class Project:
                 and not (kk == "attr" and vv == "text")}
             for k, v in spec.fields.items()
         }
+        if spec.is_lookup:
+            data["mode"] = spec.mode
+            if spec.params:
+                data["params"] = {k: {kk: vv for kk, vv in v.model_dump().items()
+                                      if vv not in (None, "", "auto", False) or kk == "required"}
+                                  for k, v in spec.params.items()}
+            if spec.cache_ttl:
+                data["cache_ttl"] = spec.cache_ttl
+            if spec.not_found:
+                data["not_found"] = spec.not_found.model_dump(exclude_none=True)
+            if spec.heal_fixture:
+                data["heal_fixture"] = spec.heal_fixture
         data["contract"] = spec.contract.model_dump()
         f.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
         return f

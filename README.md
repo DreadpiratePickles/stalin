@@ -95,6 +95,77 @@ never noticed anything.
 | 🏠 **Local-first, zero API keys** | The healer runs on your machine through Ollama. No cloud, no per-token bill, no data leaving the building. |
 | 🧠 **The LLM is optional** | Compile and healing run a ladder: stored fallbacks → DOM-statistics heuristics → local LLM. On most pages the heuristics do everything in milliseconds and the model is never consulted. No Ollama at all? You still get full detection + alerting. |
 
+## Any website → a live, queryable API  ⚡ *new in 0.2*
+
+A `static_feed` gives you one fixed page as JSON. But most of the web you'd
+actually want as an API is **parameterized** — a search box, a profile page,
+a lookup by ID. stalin turns those into live typed endpoints. Put a `{param}`
+in the URL and give one example to compile against:
+
+```console
+$ stalin add "https://quotes.toscrape.com/tag/{tag}/" -n quotes \
+    --item "each quote block on the page" \
+    --example tag=love \
+    -f "text:   str        the quote text itself
+        author: str        who said it
+        tags:   list[str]  the topic tags on the quote"
+
+  ✓ fetched quotes.toscrape.com/tag/love/  200 · 12 KB
+  ✓ text    .quote .text   verified 10/10   via heuristic
+  ✓ author  .author        verified 10/10   via heuristic
+  ✓ tags    .tags .tag      verified 10/10   via heuristic
+  live lookup — params: tag
+```
+
+That website has **no API**. It does now:
+
+```console
+$ stalin run quotes --param tag=courage --json | jq '.count'
+2
+
+$ stalin serve
+  GET /v1/quotes?tag=humor      # live, typed, on demand
+  GET /openapi.json             # the param is a documented query parameter
+```
+```console
+$ curl 'http://127.0.0.1:8411/v1/quotes?tag=love' | jq '.items[0].author'
+"André Gide"
+$ curl 'http://127.0.0.1:8411/v1/quotes'          # missing required param
+{"error": "missing required param(s): tag", "params": {"tag": "str"}}
+```
+
+**And it becomes a typed tool for your agents.** Every parameterized source is
+auto-exposed over MCP as `lookup_<name>(param=…)` with a generated input
+schema — so Claude (or any agent) calls `lookup_quotes(tag="stoicism")` and
+gets back schema-guaranteed JSON, no scraping code in the agent, no HTML in the
+prompt. That's stalin's answer to *"why not just let the agent scrape?"* — the
+tool's contract stays honest even as the site churns.
+
+### Lookups self-heal too — the hard version
+
+A live lookup returns different content for every query, so "zero results" can
+mean *the query was empty* or *the site broke*. stalin distinguishes them: you
+declare a `not_found` signal for legitimately-empty pages (never healed
+against, same rule as block pages), and healing is anchored to a **heal
+fixture** — the known-good example params you compiled with. When a real query
+comes back unexpectedly empty, stalin re-verifies selectors against the fixture
+(stable, known structure), heals there, and re-applies the fix to your query.
+Per-query variation never gets mistaken for drift.
+
+*Proven live:* pointed at a page, compiled, then renamed every CSS class and
+swapped the tags — the very next `?param=…` request healed three fields against
+the fixture and returned correct typed data, in one round, no human touch.
+
+### What works today, honestly
+
+`live_lookup` runs on static-HTML pages right now. **Path** params (`/{id}/`)
+and **query** params (`?q=…`) both work. What it does *not* do yet, and won't
+pretend to: JavaScript-rendered pages (the Playwright engine seam exists but
+isn't built), pagination/infinite-scroll, and anything behind a login or
+CAPTCHA — those stay refused, by design. It does **public, unauthenticated,
+static surfaces**. That covers a huge amount of "this site should've had an
+API" — and none of the stuff that gets you sued.
+
 ## How healing works
 
 ```
@@ -156,6 +227,8 @@ stalin doctor
 |---|---|
 | `stalin init` | Scaffold a project (`stalin.yml`, `sources/`, `.stalin/`) |
 | `stalin add <url> -n NAME -f "…"` | Compile a new source: fetch → generate selectors → verify → save |
+| `stalin add "<url/{param}>" --example param=v …` | Compile a **live_lookup**: any templated URL → a queryable API |
+| `stalin run SOURCE --param k=v` | Run a live lookup for specific params |
 | `stalin run [SOURCE…]` | Extract now. Auto-heals on drift. JSON to stdout when piped |
 | `stalin run --no-heal` | Detect drift, report, exit 3 — never heal (CI mode) |
 | `stalin heal [SOURCE[.FIELD]]` | Force a heal pass (includes the LLM rung) |
@@ -270,6 +343,7 @@ For a tool with this name, it is suspiciously well-behaved:
 | Detects silent breakage | **5 signals, every run** | – | – | – |
 | Works fully offline/local | **yes (BYO Ollama or none)** | cloud credits | yes | yes |
 | Serves an API + OpenAPI | **built in** | cloud | – | – |
+| Parameterized lookup API (`?q=…`) | **built in** | – | – | you write it |
 | MCP server | **built in** | cloud | yes | – |
 | Cost per 10k pages | **$0** | ~$8–83 | $0 | your weekend |
 
@@ -307,11 +381,14 @@ sentence with `SELECTOR: span.karma`.
 
 ## Roadmap
 
-- [ ] Pagination (`next:` selector + `max_pages`)
+- [x] **Live parameterized lookups** (`{param}` URLs → `?q=…` APIs) — *0.2*
+- [x] **Parameterized MCP tools** (`lookup_<source>(param=…)`) — *0.2*
+- [ ] `change_watch` mode — poll a page, emit a typed webhook on change
+- [ ] `aggregate` mode — one schema joined across N sites (entity resolution)
+- [ ] `batch` mode — POST many inputs, get a typed array back
 - [ ] JS rendering engine plugin (playwright/scrapling — the seam already exists)
+- [ ] Pagination (`next:` selector + `max_pages`)
 - [ ] Item-selector healing (fields heal; the container selector doesn't yet)
-- [ ] Webhooks / alert integrations (today: exit codes + `/healthz`)
-- [ ] `stalin diff` — show extracted-data changes between runs
 
 ## Contributing
 
