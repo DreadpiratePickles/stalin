@@ -486,6 +486,40 @@ def watch(sources: List[str] = typer.Argument(None)):
 
 # --------------------------------------------------------------------------
 @app.command()
+def ask(
+    source: str = typer.Argument(..., help="Source to query"),
+    question: List[str] = typer.Argument(..., help="Plain-English question"),
+    as_json: bool = typer.Option(False, "--json", help="Force JSON to stdout"),
+    items_only: bool = typer.Option(False, "--items", help="print only the items array"),
+):
+    """Ask a source a plain-English question (local LLM compiles it to a query)."""
+    project = _project()
+    _names(project, [source])
+    spec = project.load_source(source)
+    q = " ".join(question)
+    import asyncio as _asyncio
+    from .ask import run_ask
+    with err_console.status(f"compiling “{q}” …"):
+        env = _asyncio.run(run_ask(project, spec, q))
+    if env.get("error"):
+        err_console.print(f"  {FAIL} {env.get('error')}: {env.get('detail','')}")
+        if env.get("compiled"):
+            err_console.print(f"      compiled: {env['compiled']}")
+        raise typer.Exit(2)
+    compiled = env.get("_query", {})
+    err_console.print(f"  {OK} [dim]compiled →[/dim] "
+                      f"{ {k: v for k, v in compiled.items() if v} }")
+    err_console.print(f"  {OK} [bold]{source}[/bold]  "
+                      f"{env.get('returned', 0)}/{env.get('count', 0)} items")
+    if items_only:
+        print(json.dumps(env.get("items", []), ensure_ascii=False, indent=2))
+    elif as_json or not is_tty():
+        emit_json(env)
+    elif env.get("items"):
+        items_table(source, env.get("url", ""), env["items"])
+
+
+@app.command()
 def mcp():
     """MCP server on stdio (read-only tools: list_sources, get_data, get_schema)."""
     project = _project()

@@ -231,6 +231,7 @@ stalin doctor
 | `stalin run SOURCE --param k=v` | Run a live lookup for specific params |
 | `stalin run SOURCE -w "f__op=v" --sort -f --fields a,b --limit N` | Filter/sort/select/paginate results |
 | `GET /v1/SOURCE?f__gt=1&sort=-f&fields=a,b&limit=N&q=…` | Query over HTTP (see [Query it](#query-it--new-in-03)) |
+| `stalin ask SOURCE "plain-English question"` | Let the local LLM compile a query for you |
 | `stalin run [SOURCE…]` | Extract now. Auto-heals on drift. JSON to stdout when piped |
 | `stalin run --no-heal` | Detect drift, report, exit 3 — never heal (CI mode) |
 | `stalin heal [SOURCE[.FIELD]]` | Force a heal pass (includes the LLM rung) |
@@ -337,6 +338,33 @@ no HTML in the prompt.
 Self-healing is untouched: the query layer runs on already-typed items,
 downstream of extraction and healing.
 
+## Ask it in plain English  🗣️ *new in 0.4*
+
+Don't want to learn the filter grammar? Ask. A local model compiles your
+question into a query and runs it through the exact engine from
+[Query it](#query-it--new-in-03) — same filters, same types, same safety.
+
+```console
+$ stalin ask quotes "3 love quotes not by Marilyn Monroe, just author and text"
+  ✓ compiled → {'filters': {'author__ne': 'Marilyn Monroe'}, 'fields': ['author','text'], 'limit': 3}
+  ✓ quotes  3/7 items
+```
+```
+GET /v1/quotes/ask?q=love%20quotes%20over%20100%20points%2C%20newest%20first
+```
+And as an MCP tool for agents — every source gets `ask_<source>(question)`.
+
+**The LLM only proposes; the engine disposes.** The model never sees the data
+and never decides the answer — it emits a query in stalin's own grammar,
+`parse_query` validates it against the schema (a bad guess is retried, not
+served), and the deterministic engine runs it. Every response echoes the
+compiled query in `_query` and the original in `_meta.question`, so you always
+see exactly what it did — it can be incomplete, but never silently wrong.
+
+Compilation quality tracks your local model: a small model (e.g. `qwen3:1.7b`)
+handles clear questions well and occasionally drops a constraint; a larger one
+is sharper. No Ollama, no `ask` — the structured query layer still works.
+
 ## The API
 
 `stalin serve` gives you versioned, contract-stable endpoints over cached
@@ -442,7 +470,7 @@ sentence with `SELECTOR: span.karma`.
 - [x] **Live parameterized lookups** (`{param}` URLs → `?q=…` APIs) — *0.2*
 - [x] **Parameterized MCP tools** (`lookup_<source>(param=…)`) — *0.2*
 - [x] **Queryable results** — filter/sort/fields/paginate/search on every surface — *0.3*
-- [ ] `ask_<source>("plain-English question")` — NL → the 0.3 query engine
+- [x] **`ask_<source>("plain-English question")`** — NL → the query engine, on every surface — *0.4*
 - [ ] `change_watch` mode — poll a page, emit a typed webhook on change
 - [ ] `aggregate` mode — one schema joined across N sites (entity resolution)
 - [ ] `batch` mode — POST many inputs, get a typed array back

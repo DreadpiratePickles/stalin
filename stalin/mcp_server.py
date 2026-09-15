@@ -99,7 +99,42 @@ def _lookup_tools(project: Project) -> list:
     return tools
 
 
+def _ask_tools(project: Project) -> list:
+    """Every source gets ask_<source>(question) — plain-English querying."""
+    tools = []
+    for n in project.source_names():
+        try:
+            spec = project.load_source(n)
+        except Exception:
+            continue
+        tools.append({
+            "name": f"ask_{n}",
+            "description": (f"Ask {n} a plain-English question; a local LLM "
+                            f"compiles it into a typed query (filter/sort/limit/…) "
+                            f"over the fields [{_field_doc(spec)}] and returns the "
+                            f"matching JSON. The response echoes the compiled query "
+                            f"in _query so you can verify it."),
+            "inputSchema": {"type": "object",
+                            "properties": {"question": {"type": "string"}},
+                            "required": ["question"]},
+        })
+    return tools
+
+
 def _call_tool(project: Project, name: str, args: dict) -> dict:
+    if name.startswith("ask_"):
+        src = name[len("ask_"):]
+        if src not in project.source_names():
+            return {"content": [{"type": "text", "text": f"unknown source {src!r}"}],
+                    "isError": True}
+        import asyncio
+        from .ask import run_ask
+        spec = project.load_source(src)
+        env = asyncio.run(run_ask(project, spec, (args or {}).get("question", "")))
+        if env.get("error"):
+            return {"content": [{"type": "text", "text": json.dumps(env)}],
+                    "isError": True}
+        return _tool_result(env)
     if name.startswith("lookup_"):
         src = name[len("lookup_"):]
         if src not in project.source_names():
@@ -179,7 +214,7 @@ def serve_stdio(project: Project) -> None:
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "stalin", "version": "0.1.0"}}
         elif method == "tools/list":
-            resp = {"tools": TOOLS + _lookup_tools(project)}
+            resp = {"tools": TOOLS + _lookup_tools(project) + _ask_tools(project)}
         elif method == "tools/call":
             p = req.get("params", {})
             try:

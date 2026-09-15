@@ -93,7 +93,7 @@ def _openapi(project: Project) -> dict:
     return {"openapi": "3.1.0",
             "info": {"title": "stalin API",
                      "description": "Self-healing, queryable typed JSON from websites.",
-                     "version": "0.3.0"},
+                     "version": "0.4.0"},
             "components": {"responses": {"InvalidQuery": {
                 "description": "Malformed query (bad filter, operator, or control)",
                 "content": {"application/json": {"schema": {"type": "object",
@@ -180,6 +180,20 @@ def make_app(project: Project):
                 else:
                     status, headers, payload = _json_response(
                         429, {"error": "refresh already running or cooling down"})
+            elif rest.endswith("/ask") and rest[:-4] in names and method == "GET":
+                from urllib.parse import parse_qs
+                from .ask import run_ask
+                name = rest[:-4]
+                spec = project.load_source(name)
+                qs = parse_qs(scope.get("query_string", b"").decode())
+                question = (qs.get("q") or qs.get("question") or [""])[0]
+                if not question:
+                    status, headers, payload = _json_response(
+                        400, {"error": "missing 'q' (the question)"})
+                else:
+                    env = await run_ask(project, spec, question)
+                    code = 400 if env.get("error") else 200
+                    status, headers, payload = _json_response(code, env)
             elif rest in names and method == "GET":
                 spec = project.load_source(rest)
                 from urllib.parse import parse_qs
