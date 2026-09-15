@@ -36,13 +36,46 @@ def _openapi(project: Project) -> dict:
                        "schema": {"type": "string"},
                        "description": pp.desc}
                       for pn, pp in spec.params.items()] if spec.is_lookup else []
+        # Q-layer: five controls + one equality param per field, correctly typed.
+        _t = {"int": "integer", "float": "number", "bool": "boolean"}
+        ops_by_field = {}
+        for fn, ft in spec.ftypes.items():
+            base = ["eq", "ne", "in", "isnull"]
+            if ft.base in ("int", "float", "datetime"):
+                base += ["gt", "gte", "lt", "lte"]
+            if ft.is_list or ft.base in ("str", "url"):
+                base += ["contains"]
+            ops_by_field[fn] = base
+            params_doc.append({
+                "name": fn, "in": "query", "required": False,
+                "schema": {"type": _t.get(ft.base, "string")},
+                "description": f"filter {fn} ({ft.spec}); operators: "
+                               + ", ".join(f"{fn}__{o}" for o in base)})
+        params_doc += [
+            {"name": "sort", "in": "query", "required": False,
+             "schema": {"type": "string"},
+             "description": "e.g. -" + (next(iter(spec.ftypes), "field"))
+                            + " (- = desc, comma = tiebreak)"},
+            {"name": "fields", "in": "query", "required": False,
+             "schema": {"type": "string"}, "description": "comma list to project"},
+            {"name": "limit", "in": "query", "required": False,
+             "schema": {"type": "integer", "maximum": 1000}},
+            {"name": "offset", "in": "query", "required": False,
+             "schema": {"type": "integer", "minimum": 0}},
+            {"name": "q", "in": "query", "required": False,
+             "schema": {"type": "string"},
+             "description": "case-insensitive substring across text fields"},
+        ]
         summary = (f"Live lookup {name} by {', '.join(spec.params)}"
                    if spec.is_lookup else f"Latest {name} data (cached snapshot)")
         paths[f"/v1/{name}"] = {
             "get": {
                 "summary": summary,
+                "x-stalin-operators": ops_by_field,
                 "parameters": params_doc,
-                "responses": {"200": {
+                "responses": {
+                    "400": {"$ref": "#/components/responses/InvalidQuery"},
+                    "200": {
                     "description": "envelope",
                     "content": {"application/json": {"schema": {
                         "type": "object",
@@ -59,8 +92,15 @@ def _openapi(project: Project) -> dict:
                     "responses": {"200": {"description": "schema"}}}}
     return {"openapi": "3.1.0",
             "info": {"title": "stalin API",
-                     "description": "Self-healing typed JSON from websites.",
-                     "version": "0.1.0"},
+                     "description": "Self-healing, queryable typed JSON from websites.",
+                     "version": "0.3.0"},
+            "components": {"responses": {"InvalidQuery": {
+                "description": "Malformed query (bad filter, operator, or control)",
+                "content": {"application/json": {"schema": {"type": "object",
+                    "properties": {
+                        "error": {"type": "string"}, "param": {"type": "string"},
+                        "code": {"type": "string"}, "expected_type": {"type": "string"},
+                        "detail": {"type": "string"}}}}}}}},
             "paths": paths}
 
 
@@ -142,30 +182,41 @@ def make_app(project: Project):
                         429, {"error": "refresh already running or cooling down"})
             elif rest in names and method == "GET":
                 spec = project.load_source(rest)
-                if spec.is_lookup:
-                    from urllib.parse import parse_qs
-                    qs = parse_qs(scope.get("query_string", b"").decode())
-                    values = {k: v[0] for k, v in qs.items()}
-                    missing = spec.missing_params(values)
-                    if missing:
-                        status, headers, payload = _json_response(
-                            400, {"error": f"missing required param(s): {', '.join(missing)}",
-                                  "params": {n: p.type for n, p in spec.params.items()}})
-                    else:
-                        from .lookup import run_lookup
-                        lock = Lock.load(project.lock_path)
-                        lres = await run_lookup(project, spec, lock, values)
-                        code = {"ok": 200, "not_found": 200, "blocked": 502,
-                                "broken": 503, "error": 400}.get(lres.status, 200)
-                        status, headers, payload = _json_response(code, lres.envelope)
+                from urllib.parse import parse_qs
+                from .query import parse_query, apply, QueryError, query_envelope
+                qs = parse_qs(scope.get("query_string", b"").decode())
+                raw_params = {k: v[0] for k, v in qs.items()}
+                try:
+                    query, lookup_args = parse_query(
+                        raw_params, spec.ftypes,
+                        set(spec.params) if spec.is_lookup else set())
+                except QueryError as qe:
+                    status, headers, payload = _json_response(400, qe.as_dict())
                 else:
-                    dp = project.data_path(rest)
-                    if dp.exists():
-                        env = json.loads(dp.read_text())
-                        status, headers, payload = _json_response(200, env)
+                    if spec.is_lookup:
+                        missing = spec.missing_params(lookup_args)
+                        if missing:
+                            status, headers, payload = _json_response(
+                                400, {"error": "invalid_query", "code": "missing_param",
+                                      "detail": f"missing required param(s): {', '.join(missing)}",
+                                      "params": {n: p.type for n, p in spec.params.items()}})
+                        else:
+                            from .lookup import run_lookup
+                            lock = Lock.load(project.lock_path)
+                            lres = await run_lookup(project, spec, lock, lookup_args)
+                            code = {"ok": 200, "not_found": 200, "blocked": 502,
+                                    "broken": 503, "error": 400}.get(lres.status, 200)
+                            env = query_envelope(lres.envelope, query, spec.ftypes)
+                            status, headers, payload = _json_response(code, env)
                     else:
-                        status, headers, payload = _json_response(
-                            503, {"error": f"no data yet for {rest!r} — run `stalin run {rest}`"})
+                        dp = project.data_path(rest)
+                        if dp.exists():
+                            base = json.loads(dp.read_text())
+                            env = query_envelope(base, query, spec.ftypes)
+                            status, headers, payload = _json_response(200, env)
+                        else:
+                            status, headers, payload = _json_response(
+                                503, {"error": f"no data yet for {rest!r} — run `stalin run {rest}`"})
         await send({"type": "http.response.start", "status": status,
                     "headers": headers})
         await send({"type": "http.response.body", "body": payload})
