@@ -229,6 +229,8 @@ stalin doctor
 | `stalin add <url> -n NAME -f "…"` | Compile a new source: fetch → generate selectors → verify → save |
 | `stalin add "<url/{param}>" --example param=v …` | Compile a **live_lookup**: any templated URL → a queryable API |
 | `stalin run SOURCE --param k=v` | Run a live lookup for specific params |
+| `stalin run SOURCE -w "f__op=v" --sort -f --fields a,b --limit N` | Filter/sort/select/paginate results |
+| `GET /v1/SOURCE?f__gt=1&sort=-f&fields=a,b&limit=N&q=…` | Query over HTTP (see [Query it](#query-it--new-in-03)) |
 | `stalin run [SOURCE…]` | Extract now. Auto-heals on drift. JSON to stdout when piped |
 | `stalin run --no-heal` | Detect drift, report, exit 3 — never heal (CI mode) |
 | `stalin heal [SOURCE[.FIELD]]` | Force a heal pass (includes the LLM rung) |
@@ -279,7 +281,63 @@ without ever dirtying a file you edit.
 `str` · `int` · `float` · `bool` · `url` (resolved absolute) · `datetime`
 (ISO-8601 out) · `list[str]` · `enum[a,b,c]` — all nullable via `| null`.
 
-### The API
+### Query it  🔎 *new in 0.3*
+
+Every source is now a **queryable** API — filter, sort, select fields, paginate,
+and full-text search over the extracted items. Same grammar on HTTP, the MCP
+tools, and the CLI. No more piping everything through `jq`.
+
+```console
+# 3 love quotes NOT by Marilyn Monroe, sorted by author, trimmed payload
+$ curl "localhost:8411/v1/quotes?tag=love&author__ne=Marilyn%20Monroe&sort=author&fields=text,author&limit=3"
+{
+  "count": 7,          // total matching the filters (before limit)
+  "returned": 3,       // how many came back
+  "items": [ {"author": "André Gide",  "text": "…"}, … ],
+  "_query": {"filters": {"author__ne": "Marilyn Monroe"},
+             "sort": "author", "fields": ["text","author"], "limit": 3, "offset": 0}
+}
+```
+
+**Controls:** `sort=-points,author` (`-` = desc) · `fields=a,b` (project) ·
+`limit` / `offset` · `q=` (case-insensitive substring across text fields).
+
+**Filters** are `field` (equality) or `field__op`:
+
+| op | meaning | op | meaning |
+|---|---|---|---|
+| `__eq` `__ne` | equals / not | `__in` | `points__in=90,212` |
+| `__gt` `__gte` `__lt` `__lte` | ordering (int/float/datetime) | `__contains` | substring, or list membership |
+| `__isnull` | `points__isnull=true` | | |
+
+Filters are **type-aware**: `points__gt=100` compares as an int, `when__gte=2026-01-01`
+as a datetime. A bad value is a typed **400**, never a 500:
+
+```json
+{"error":"invalid_query","param":"points__gt","code":"invalid_value","expected_type":"int"}
+```
+
+**One rule where lookups and filters share a URL:** for a `live_lookup` source, a
+bare key that matches a declared param (`?tag=love`) drives the fetch; everything
+else is a control or a filter. If a field happens to share a param's name, filter
+it explicitly with `field__eq=…`.
+
+**From the terminal** — identical grammar:
+
+```bash
+stalin run quotes -p tag=love -w "author__ne=Marilyn Monroe"   --sort author --fields text,author --limit 3
+```
+
+**For agents (MCP):** `get_data` and every `lookup_<source>` tool take
+`filter` (a `{field__op: value}` object), `sort`, `fields`, `limit`, `offset`,
+and `q`. Each tool's description lists the source's filterable fields and types,
+so a model can query precisely straight from `get_schema` — no scraping code,
+no HTML in the prompt.
+
+Self-healing is untouched: the query layer runs on already-typed items,
+downstream of extraction and healing.
+
+## The API
 
 `stalin serve` gives you versioned, contract-stable endpoints over cached
 snapshots (your consumers never wait on a fetch, and target sites never sit
@@ -383,6 +441,8 @@ sentence with `SELECTOR: span.karma`.
 
 - [x] **Live parameterized lookups** (`{param}` URLs → `?q=…` APIs) — *0.2*
 - [x] **Parameterized MCP tools** (`lookup_<source>(param=…)`) — *0.2*
+- [x] **Queryable results** — filter/sort/fields/paginate/search on every surface — *0.3*
+- [ ] `ask_<source>("plain-English question")` — NL → the 0.3 query engine
 - [ ] `change_watch` mode — poll a page, emit a typed webhook on change
 - [ ] `aggregate` mode — one schema joined across N sites (entity resolution)
 - [ ] `batch` mode — POST many inputs, get a typed array back

@@ -157,6 +157,14 @@ def add(
         # query-style params: supplied via --example but not in the path template
         qparams = {k for k in ex if k not in placeholders}
         if placeholders or qparams:
+            from .query import CONTROLS
+            for pn in list(placeholders) + list(qparams):
+                if pn in CONTROLS or "__" in pn:
+                    err_console.print(
+                        f"  {FAIL} param {pn!r} collides with the query layer "
+                        f"(reserved: {', '.join(CONTROLS)}; '__' is the filter operator "
+                        f"separator). Rename it in the URL, e.g. {{{pn}_}}.")
+                    raise typer.Exit(1)
             params = {pn: ParamSpec(location="path",
                                     desc=f"the {pn} to look up") for pn in placeholders}
             for pn in qparams:
@@ -285,8 +293,16 @@ def add(
 @app.command()
 def run(
     sources: List[str] = typer.Argument(None),
-    param: List[str] = typer.Option(None, "--param",
+    param: List[str] = typer.Option(None, "-p", "--param",
                                     help="For live_lookup sources: name=value (repeatable)"),
+    where: List[str] = typer.Option(None, "-w", "--where",
+                                    help="Filter: field__op=value or field=value (repeatable)"),
+    sort: Optional[str] = typer.Option(None, "--sort", help="e.g. -points,author"),
+    fields: Optional[str] = typer.Option(None, "--fields", help="comma list to project"),
+    limit: Optional[int] = typer.Option(None, "--limit"),
+    offset: Optional[int] = typer.Option(None, "--offset"),
+    q: Optional[str] = typer.Option(None, "-q", "--query", help="full-text substring"),
+    items_only: bool = typer.Option(False, "--items", help="print only the items array"),
     as_json: bool = typer.Option(False, "--json", help="Force JSON to stdout"),
     jsonl: Optional[Path] = typer.Option(None, "--jsonl", help="Append envelope to JSONL file"),
     flat: bool = typer.Option(False, "--flat", help="With --jsonl: one item per line"),
@@ -298,6 +314,23 @@ def run(
     """Extract now. Auto-heals on drift (that's the whole point)."""
     project = _project()
     names = _names(project, sources or [])
+    from .query import parse_query, query_envelope, QueryError
+
+    def _raw_query() -> dict:
+        raw = _parse_kv(where)
+        if sort is not None: raw["sort"] = sort
+        if fields is not None: raw["fields"] = fields
+        if limit is not None: raw["limit"] = str(limit)
+        if offset is not None: raw["offset"] = str(offset)
+        if q is not None: raw["q"] = q
+        return raw
+
+    def _emit(env: dict):
+        if items_only:
+            print(json.dumps(env.get("items", []), ensure_ascii=False, indent=2))
+        else:
+            emit_json(env)
+
     # live_lookup sources take --param and run live
     lookup_names = [n for n in names if project.load_source(n).is_lookup]
     if lookup_names:
@@ -308,20 +341,26 @@ def run(
         from .lookup import run_lookup
         from .lockfile import Lock as _Lock
         spec = project.load_source(names[0])
-        values = _parse_kv(param)
+        raw = {**_parse_kv(param), **_raw_query()}
+        try:
+            query, lookup_args = parse_query(raw, spec.ftypes, set(spec.params))
+        except QueryError as qe:
+            err_console.print(f"  {FAIL} {qe.as_dict()}")
+            raise typer.Exit(2)
         lock = _Lock.load(project.lock_path)
-        lres = _asyncio.run(run_lookup(project, spec, lock, values))
+        lres = _asyncio.run(run_lookup(project, spec, lock, lookup_args))
+        env = query_envelope(lres.envelope, query, spec.ftypes) if lres.envelope else {}
         mark = OK if lres.status in ("ok", "not_found") else FAIL
         healed = (f"  ({len(lres.healed_fields)} healed)" if lres.healed_fields else "")
         err_console.print(f"  {mark} [bold]{lres.source}[/bold]  {lres.status.upper()}  "
-                          f"{lres.envelope.get('count', 0)} items  {lres.elapsed:.1f}s"
-                          f"{healed}")
+                          f"{env.get('returned', 0)}/{env.get('count', 0)} items  "
+                          f"{lres.elapsed:.1f}s{healed}")
         if lres.error:
             err_console.print(f"      {lres.error}")
-        if lres.envelope and (as_json or not is_tty()):
-            emit_json(lres.envelope)
-        elif lres.items and is_tty():
-            items_table(lres.source, lres.envelope.get("url", ""), lres.items)
+        if env and (as_json or items_only or not is_tty()):
+            _emit(env)
+        elif env.get("items") and is_tty():
+            items_table(lres.source, env.get("url", ""), env["items"])
         raise typer.Exit(lres.exit_code)
     from .runner import run_sources_sync
     ui = UI()
@@ -329,10 +368,19 @@ def run(
     worst = 0
     for res in results:
         summary_line(res)
-        if res.envelope and (as_json or not is_tty()):
-            emit_json(res.envelope)
-        elif res.items and is_tty() and not as_json:
-            items_table(res.source, res.envelope.get("url", ""), res.items)
+        env = res.envelope
+        if env:
+            spec = project.load_source(res.source)
+            try:
+                query, _ = parse_query(_raw_query(), spec.ftypes, set())
+                env = query_envelope(env, query, spec.ftypes)
+            except QueryError as qe:
+                err_console.print(f"  {FAIL} {qe.as_dict()}")
+                raise typer.Exit(2)
+        if env and (as_json or items_only or not is_tty()):
+            _emit(env)
+        elif env and env.get("items") and is_tty() and not as_json:
+            items_table(res.source, env.get("url", ""), env["items"])
         if jsonl and res.envelope:
             jsonl.parent.mkdir(parents=True, exist_ok=True)
             with jsonl.open("a") as f:

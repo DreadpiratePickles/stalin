@@ -13,15 +13,52 @@ from .schema import json_schema
 
 PROTOCOL_VERSION = "2025-06-18"
 
+
+_QUERY_PROPS = {
+    "filter": {"type": "object",
+               "description": "Field filters, same spelling as HTTP: keys are "
+                              "`field` (equality) or `field__op` where op is one of "
+                              "eq/ne/gt/gte/lt/lte/in/contains/isnull. Values may be "
+                              "native JSON or strings. e.g. {\"points__gt\": 100}."},
+    "sort": {"type": "string", "description": "e.g. '-points,author' (- = desc)"},
+    "fields": {"type": "string", "description": "comma list to project, e.g. 'author,text'"},
+    "limit": {"type": "integer"},
+    "offset": {"type": "integer"},
+    "q": {"type": "string", "description": "case-insensitive substring across text fields"},
+}
+
+
+def _field_doc(spec) -> str:
+    return "; ".join(f"{n}:{ft.spec}" for n, ft in spec.ftypes.items())
+
+
+def _query_args_to_params(args: dict) -> dict:
+    """Flatten MCP query args into the flat param map parse_query expects."""
+    raw = {}
+    flt = args.get("filter") or {}
+    if isinstance(flt, dict):
+        for k, v in flt.items():
+            raw[k] = v
+    for ctrl in ("sort", "fields", "q"):
+        if args.get(ctrl) not in (None, ""):
+            raw[ctrl] = str(args[ctrl])
+    for ctrl in ("limit", "offset"):
+        if args.get(ctrl) is not None:
+            raw[ctrl] = str(args[ctrl])
+    return raw
+
+
+
 TOOLS = [
     {"name": "list_sources",
      "description": "List all configured stalin sources with status and schema version.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "get_data",
      "description": ("Get the latest extracted data for a source as typed JSON "
-                     "(cached last-good snapshot; includes fetched_at and stale flag)."),
+                     "(cached last-good snapshot). Supports filter/sort/fields/"
+                     "limit/offset/q — see get_schema for field names and types."),
      "inputSchema": {"type": "object",
-                     "properties": {"source": {"type": "string"}},
+                     "properties": {"source": {"type": "string"}, **_QUERY_PROPS},
                      "required": ["source"]}},
     {"name": "get_schema",
      "description": "Get the JSON Schema contract for a source.",
@@ -29,6 +66,7 @@ TOOLS = [
                      "properties": {"source": {"type": "string"}},
                      "required": ["source"]}},
 ]
+
 
 
 def _tool_result(payload) -> dict:
@@ -48,12 +86,14 @@ def _lookup_tools(project: Project) -> list:
             continue
         props = {pn: {"type": "string", "description": pp.desc}
                  for pn, pp in spec.params.items()}
+        props.update(_QUERY_PROPS)
         required = [pn for pn, pp in spec.params.items() if pp.required]
         tools.append({
             "name": f"lookup_{n}",
-            "description": (f"Live lookup of {n} by {', '.join(spec.params)}. "
-                            f"Returns typed, self-healing JSON scraped on demand from "
-                            f"{spec.url}."),
+            "description": (f"Live lookup of {n} by {', '.join(spec.params)}, scraped "
+                            f"on demand from {spec.url}. Returns typed, self-healing "
+                            f"JSON. Filterable fields — {_field_doc(spec)}. Use "
+                            f"filter/sort/fields/limit/offset/q to narrow results."),
             "inputSchema": {"type": "object", "properties": props, "required": required},
         })
     return tools
@@ -68,10 +108,25 @@ def _call_tool(project: Project, name: str, args: dict) -> dict:
         import asyncio
         from .lookup import run_lookup
         from .lockfile import Lock
+        from .query import parse_query, query_envelope, QueryError
         spec = project.load_source(src)
+        args = args or {}
+        raw = _query_args_to_params(args)
+        for pn in spec.params:                       # declared params from top-level args
+            if pn in args and pn not in raw:
+                raw[pn] = args[pn]
+        try:
+            query, lookup_args = parse_query(raw, spec.ftypes, set(spec.params))
+        except QueryError as qe:
+            return {"content": [{"type": "text",
+                                 "text": json.dumps(qe.as_dict())}], "isError": True}
         lock = Lock.load(project.lock_path)
-        lres = asyncio.run(run_lookup(project, spec, lock, args or {}))
-        return _tool_result(lres.envelope or {"error": lres.error, "status": lres.status})
+        lres = asyncio.run(run_lookup(project, spec, lock, lookup_args))
+        if not lres.envelope:
+            return {"content": [{"type": "text",
+                                 "text": json.dumps({"error": lres.error, "status": lres.status})}],
+                    "isError": True}
+        return _tool_result(query_envelope(lres.envelope, query, spec.ftypes))
     if name == "list_sources":
         from .lockfile import Lock
         lock = Lock.load(project.lock_path)
@@ -93,7 +148,14 @@ def _call_tool(project: Project, name: str, args: dict) -> dict:
             return {"content": [{"type": "text",
                                  "text": f"no data yet — run `stalin run {src}`"}],
                     "isError": True}
-        return _tool_result(json.loads(dp.read_text()))
+        from .query import parse_query, query_envelope, QueryError
+        spec = project.load_source(src)
+        try:
+            query, _ = parse_query(_query_args_to_params(args), spec.ftypes, set())
+        except QueryError as qe:
+            return {"content": [{"type": "text",
+                                 "text": json.dumps(qe.as_dict())}], "isError": True}
+        return _tool_result(query_envelope(json.loads(dp.read_text()), query, spec.ftypes))
     if name == "get_schema":
         spec = project.load_source(src)
         return _tool_result(json_schema(src, spec.ftypes, spec.contract.version))
